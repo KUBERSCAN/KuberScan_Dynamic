@@ -1,6 +1,11 @@
-import { KubeConfig, CoreV1Api, NetworkingV1Api } from "@kubernetes/client-node";
+import {
+  CoreV1Api,
+  KubeConfig,
+  NetworkingV1Api,
+} from "@kubernetes/client-node";
 import express, { Request, Response } from "express";
 import { Quarantined } from "../DB/quarantined.ts";
+import { Incident } from "../DB/incidents.ts";
 
 const router = express.Router();
 
@@ -15,6 +20,29 @@ if (Deno.env.get("KUBERNETES_SERVICE_HOST")) {
 const k8sApi = kc.makeApiClient(CoreV1Api);
 const networkingApi = kc.makeApiClient(NetworkingV1Api);
 
+const upsertIncidentStatus = async (
+  pod: string,
+  namespace: string,
+  status: "open" | "quarantined" | "deleted",
+) => {
+  const result = await Incident.updateMany(
+    { pod, namespace },
+    { $set: { status } },
+  );
+
+  if (result.matchedCount === 0) {
+    const incident = new Incident({
+      id: `${namespace}-${pod}`,
+      pod,
+      namespace,
+      severity: "unknown",
+      alertCount: 0,
+      status,
+    });
+    await incident.save();
+  }
+};
+
 router.post("/", async (req: Request, res: Response) => {
   try {
     const { namespace, pod } = req.body;
@@ -23,19 +51,18 @@ router.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Missing params" });
     }
 
-    // quarantined=true al pod
-    const patch = [
-      { op: "add", path: "/metadata/labels/quarantined", value: "true" },
-    ];
-
     await k8sApi.patchNamespacedPod({
       name: pod,
       namespace,
-      body: patch,
-      contentType: "application/json-patch+json",
+      body: {
+        metadata: {
+          labels: {
+            quarantined: "true",
+          },
+        },
+      },
     });
 
-    // NetworkPolicy bloquear el trafico 
     const networkPolicy = {
       apiVersion: "networking.k8s.io/v1",
       kind: "NetworkPolicy",
@@ -50,35 +77,37 @@ router.post("/", async (req: Request, res: Response) => {
           },
         },
         policyTypes: ["Ingress", "Egress"],
-        // Ingress Egress vacíos para bloquear el tráfico
         ingress: [],
         egress: [],
       },
     };
 
-    // NetworkPolicy
     try {
       await networkingApi.createNamespacedNetworkPolicy({
         namespace,
         body: networkPolicy,
       });
-      console.log(`NetworkPolicy creada`);
-    } catch (err) {
-      if (err.code === 409) {
-        console.log(`NetworkPolicy existe`);
-      } else {
+    } catch (err: any) {
+      if (err?.code !== 409) {
         throw err;
       }
     }
-    const addQuarantine = new Quarantined({pod:pod,namespace:namespace})
-    await addQuarantine.save()
-    if(!addQuarantine){return res.status(200).json({success: false,message:"Failed saving to DB"})}
+
+    await Quarantined.updateOne(
+      { pod, namespace },
+      { $set: { pod, namespace } },
+      { upsert: true },
+    );
+
+    await upsertIncidentStatus(pod, namespace, "quarantined");
+
     return res.status(200).json({
       success: true,
       pod,
       namespace,
+      status: "quarantined",
     });
-  } catch (err) {
+  } catch (_err) {
     return res.status(500).json({ error: "Internal Server Error" });
   }
 });
@@ -91,42 +120,47 @@ router.delete("/", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Missing params" });
     }
 
-    const patch = [
-      {
-        op: "remove",
-        path: "/metadata/labels/quarantined"
-      },
-    ];
+    try {
+      await k8sApi.patchNamespacedPod({
+        name: pod,
+        namespace,
+        body: {
+          metadata: {
+            labels: {
+              quarantined: null,
+            },
+          },
+        },
+      });
+    } catch (err: any) {
+      if (err?.code !== 422) {
+        throw err;
+      }
+    }
 
-    await k8sApi.patchNamespacedPod({
-      name: pod,
-      namespace,
-      body: patch,
-      contentType: "application/json-patch+json",
-    });
-
-    // Eliminar NetworkPolicy
     try {
       await networkingApi.deleteNamespacedNetworkPolicy({
         name: `quarantine-${pod}`,
         namespace,
       });
-    } catch (err) {
-      if (err.code === 404) {
-      } else {
+    } catch (err: any) {
+      if (err?.code !== 404) {
         throw err;
       }
     }
 
-     await Quarantined.deleteMany({ 
-      pod: pod, 
-      namespace: namespace 
+    await Quarantined.deleteMany({
+      pod,
+      namespace,
     });
+
+    await upsertIncidentStatus(pod, namespace, "open");
 
     return res.status(200).json({
       success: true,
       pod,
       namespace,
+      status: "open",
     });
   } catch (err) {
     console.error(err);
