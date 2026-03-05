@@ -84,7 +84,7 @@ router.post("/", async (req: Request, res: Response) => {
               pod: pod,
               namespace: namespace
             })
-          }}
+          })}
         const newIncident = new Incident({
           id: containerId,
           pod,
